@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  owaLlmParquetStep2:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: owa_write_parquet_step2
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: .
+      Timeout: 900
+      MemorySize: 1024
+      # Even if there are 700 files in the SQS queue, AWS will only allow 5 Lambdas to run at the same time.
+      ReservedConcurrentExecutions: 5 # The Speed Limit
+
+      # Layers MUST be at this indentation level (under Properties)
+      Layers:
+        # This AWS SDK for Pandas layer often replaces pandas, numpy, openpyxl and pyarrow
+        - arn:aws:lambda:ca-central-1:336392948345:layer:AWSSDKPandas-Python313:1
+
+      # Trigger EnventBridge
+      Events:
+        MySqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OwaExtractQueue.Arn
+            BatchSize: 1 # Process one file at a time for easier debugging
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: arn:aws:s3:::emi-v3/OWA/extracted/*
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource:
+                - arn:aws:s3:::emi-v3/OWA/clean/*
+                - arn:aws:s3:::emi-v3/OWA/clean_failed/*
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                # 1. The Inference Profile (The "Pointer")
+                - arn:aws:bedrock:ca-central-1:759080473149:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0
+
+                # 2. The Regional Foundation Model (The "Local Engine")
+                - arn:aws:bedrock:ca-central-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0
+
+                # 3. The Global Foundation Model (The "Routing Engine")
+                - arn:aws:bedrock:::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0
+
+  # --- RESOURCE 2: The Main Queue ---
+  OwaExtractQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 910 # Must be > Lambda Timeout 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OwaExtractDLQ.Arn
+        maxReceiveCount: 3
+
+  # --- RESOURCE 3: The Dead Letter Queue (The Lost & Found) ---
+  OwaExtractDLQ:
+    Type: AWS::SQS::Queue
+
+  # --- RESOURCE 4: The EventBridge Rule ---
+  S3ToSqsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: ["emi-v3"]
+          object:
+            # Using wildcard creates a strict "AND" condition: MUST be in OWA/extracted/ AND end in .json
+            key:
+              - wildcard: "OWA/extracted/*.json"
+      Targets:
+        - Arn: !GetAtt OwaExtractQueue.Arn
+          Id: "OwaQueueTarget"
+
+  # --- RESOURCE 5: Permissions for EventBridge to talk to SQS ---
+  SqsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OwaExtractQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OwaExtractQueue.Arn
+
+  # CLOUDWATCH ALARM : For the Step 2 DLQ trigger SNS topic
+  Step2DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "OWA-Step2-Enrich-DLQ-Alarm" # Distinct name
+      AlarmDescription: "Alert if files fail during AI Enrichment/Parquet write"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OwaExtractDLQ.QueueName # Pointing to DLQ #2
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - "arn:aws:sns:ca-central-1:759080473149:owa-extract-xlsm-DlqAlertTopic-xZh3ENQr8cd5" # created in step1 yaml

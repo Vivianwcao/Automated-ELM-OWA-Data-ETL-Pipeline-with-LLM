@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  # --- RESOURCE 1: The Lambda Function ---
+  owaExtractXlsmStep1:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: owa_extract_xlsm_step1
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: .
+      Timeout: 900
+      MemorySize: 1024
+      # Even if there are 700 files in the SQS queue, AWS will only allow 5 Lambdas to run at the same time.
+      ReservedConcurrentExecutions: 5 # The Speed Limit
+
+      # Layers MUST be at this indentation level (under Properties)
+      Layers:
+        # This AWS SDK for Pandas layer often replaces pandas, numpy, openpyxl and pyarrow
+        - arn:aws:lambda:ca-central-1:336392948345:layer:AWSSDKPandas-Python313:1
+
+      # Trigger EnventBridge
+      Events:
+        MySqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OwaExtractQueue.Arn
+            BatchSize: 1 # Process one file at a time for easier debugging
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - arn:aws:s3:::emi-v3/OWA/raw/*
+                - arn:aws:s3:::emi-v3/OWA/extracted/* # see if extracted file exists
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource:
+                - arn:aws:s3:::emi-v3/OWA/extracted/*
+                - arn:aws:s3:::emi-v3/OWA/extracted_failed/*
+
+  # --- RESOURCE 2: The Main Queue ---
+  OwaExtractQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 910 # Must be > Lambda Timeout 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OwaExtractDLQ.Arn
+        maxReceiveCount: 3
+
+  # --- RESOURCE 3: The Dead Letter Queue (The Lost & Found) ---
+  OwaExtractDLQ:
+    Type: AWS::SQS::Queue
+
+  # --- RESOURCE 4: The EventBridge Rule ---
+  S3ToSqsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: ["emi-v3"]
+          object:
+            # Using wildcard creates a strict "AND" condition: MUST be in OWA/raw/ AND end in .xlsm
+            key:
+              - wildcard: "OWA/raw/*.xlsm"
+              - wildcard: "OWA/raw/*.XLSM"
+              - wildcard: "OWA/raw/*.xlsx"
+              - wildcard: "OWA/raw/*.XLSX"
+      Targets:
+        - Arn: !GetAtt OwaExtractQueue.Arn
+          Id: "OwaQueueTarget"
+
+  # --- RESOURCE 5: Permissions for EventBridge to talk to SQS ---
+  SqsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OwaExtractQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OwaExtractQueue.Arn
+
+  # --- RESOURCE 6: SNS DLQ email alert ---
+  # 1. SHARED RESOURCE: The Alert Topic
+  DlqAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: "vivian.cao@entermyinvoice.com"
+
+  # 2. ALARM 1: For the Step 1 DLQ
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "OWA-Step1-Extract-DLQ-Alarm" # Give them distinct names
+      AlarmDescription: "Alert if files fail during Excel extraction"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OwaExtractDLQ.QueueName
+      Statistic: Sum
+      Period: 60 # 1 min
+      EvaluationPeriods: 2 # Must be bad for 2 minutes in a row
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DlqAlertTopic
