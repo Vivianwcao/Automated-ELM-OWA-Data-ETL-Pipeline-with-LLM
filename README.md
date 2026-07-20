@@ -64,7 +64,11 @@ AWS Glue catalogs the Silver Parquet datasets into 5 base tables in Athena. To n
 
 ### QuickSight Reporting
 Amazon QuickSight connects to the Gold Athena SQL views via the **SPICE in-memory calculation engine** on a periodic refresh schedule. This isolates dashboard user traffic (filtering bar charts, cost trends, and compliance metrics) from executing live S3 queries in Athena, minimizing query costs and latency.
-https://github.com/user-attachments/assets/13eaa9f0-97b0-4b40-9496-a2f6f893c84f
+
+
+https://github.com/user-attachments/assets/ad0d67b7-3b11-43b2-a1fc-7dd6e336887f
+
+
 
 ---
 
