@@ -42,7 +42,7 @@ I built an event driven Medallion Data Lakehouse on AWS that automatically inges
 
 ## Technical Challenges and Engineering Solutions
 
-### 1. The Files Are Visual Forms, Not Spreadsheets
+### 1. The Files Are Visual Forms instead of true Spreadsheets
 The field supervisors used Excel as a printed form layout tool rather than a database. Workbooks were built with merged cells, hand-aligned labels, and tables that started at different row offsets depending on how much notes the previous supervisor typed. With six tabs per file and subtle undocumented variations across 750 files from different contractors, standard parsing with `pd.read_excel()` failed on file one.
 
 **The Solution:**
